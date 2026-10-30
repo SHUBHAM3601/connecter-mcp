@@ -94,7 +94,7 @@ search_dirs = ['E:\Old Library']
 launch_dir = 'C:\Users\you\Documents\Design Connected\Connecter\Sample Products'
 # 3ds Max for headless jobs (default: newest installed) and how busy it may be before they wait
 max_dir = 'C:\Program Files\Autodesk\3ds Max 2024'
-max_busy_cpu = 150
+max_busy_cpu = 50
 ```
 
 ## Examples
@@ -123,12 +123,21 @@ uv run python tests/live_test.py "D:\Library\3D MODELS\09_MISC\Some Model"
 uv run python tests/extended_test.py "D:\Library\3D MODELS\09_MISC\Some Model" --clip
 ```
 
+`tests/max_test.py` is the real 3ds Max test. It runs the 3ds Max tools in headless `3dsmaxbatch` on a temporary copy of a model and checks the files and positions they produce. Scene tools run in a fresh headless scene, so an open 3ds Max is never touched. Run it only when 3ds Max is idle.
+
+```bash
+uv run python tests/max_test.py "D:\Library\3D MODELS\09_MISC\Some Model\model.max"
+```
+
 ## Connecter behaviours worth knowing
 
 * **One tag per branch.** An asset can't hold a tag and its own parent or child tag. Tagging with one replaces the other, and `tag_assets` reports how many it replaced (and `undo` puts them back). Sibling tags and tags in other branches can be combined freely.
 * **Tag colours** must come from Connecter's palette: `cyan`, `purple`, `lavender`, `yellow`, `pink`, `white`.
 * **Renaming assets.** Connecter 8.0's own rename drops the file extension, so `rename_asset` renames on disk and re-points the catalogue entry instead.
 * **Custom properties and versions** are only available in some Connecter workspaces; on others these tools say so.
+* **Assets with no data aren't in the database.** Connecter only stores a model once it has a tag, preview or description, so `search_assets` and `audit_library` can't see the others. `batch_catalogue`, `batch_relink` and `verify_textures` also read the folder from disk.
+* **A .max's metadata can list leftovers.** Files saved over the years can list paths no map uses any more. Tools that read a .max without 3ds Max report them as missing; `consistency_check(mode="batch")` and the relink tools (`not_in_scene`) tell the two apart.
+* **Relinking keeps the file as it is.** `relink_max_textures` and `batch_relink` rewrite a .max's asset paths without loading the scene, so old files stay in their 3ds Max version and keep their plugin data. `method="scene"` loads and re-saves instead. Files from before 3ds Max stored asset metadata are reported as `no_metadata`.
 * **Hiding files.** There is no hide command in Connecter's API, so `hide_files` uses the hiding Connecter applies to previews. Files can only be unhidden in Connecter itself (right-click > Unhide).
 * **Removing previews by path** is rejected by Connecter ("invalid asset paths"), so the tools look up each preview's GUID first.
 

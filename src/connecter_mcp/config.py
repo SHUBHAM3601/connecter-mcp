@@ -97,7 +97,7 @@ class Settings:
     # 3ds Max install folder for headless jobs (3dsmaxbatch.exe). Defaults to the newest installed version.
     max_dir: Path | None = None
     # Headless 3ds Max jobs are refused while 3ds Max uses more CPU than this (in % of one core), e.g. while rendering.
-    max_busy_cpu: float = 150.0
+    max_busy_cpu: float = 50.0
 
     @classmethod
     def load(cls) -> "Settings":
@@ -110,5 +110,5 @@ class Settings:
             launch_dir=Path(data["launch_dir"]) if data.get("launch_dir") else None,
             downloads_dir=Path(data["downloads_dir"]) if data.get("downloads_dir") else Path.home() / "Downloads",
             max_dir=Path(data["max_dir"]) if data.get("max_dir") else None,
-            max_busy_cpu=float(data.get("max_busy_cpu", 150.0)),
+            max_busy_cpu=float(data.get("max_busy_cpu", 50.0)),
         )
