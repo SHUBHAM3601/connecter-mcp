@@ -122,5 +122,7 @@ class FileIndex:
                 if cand != name:
                     score = difflib.SequenceMatcher(None, name, cand).ratio()
                     results += [{"path": p, "match": "similar name", "confidence": round(score * 0.8, 2)} for p in index[cand]]
+        # The index is cached, so drop files that have been moved or deleted since it was built.
+        results = [r for r in results if os.path.exists(r["path"])]
         results.sort(key=lambda r: -r["confidence"])
         return results[:limit]

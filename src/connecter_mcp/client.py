@@ -15,11 +15,13 @@ import time
 import uuid
 from pathlib import Path
 
+from mcp.server.mcpserver.exceptions import ToolError
+
 from .config import Paths, discover
 
 
-class ConnecterError(RuntimeError):
-    pass
+class ConnecterError(ToolError):
+    """A failure worth showing to the user; MCP clients receive its message."""
 
 
 class ConnecterClient:
@@ -71,6 +73,9 @@ class ConnecterClient:
                     continue
                 body = reply.get("Payload") or {}
                 if reply.get("Type") == "ErrorResponse":
+                    if body.get("ErrorCode") == 3:  # no handler registered for this message type
+                        raise ConnecterError(f"This Connecter workspace doesn't support '{type_}' "
+                                             "(some features exist only in Connecter's team/hosted workspaces).")
                     raise ConnecterError(body.get("ErrorMessage") or "Connecter returned an error")
                 if body.get("Status", 0) not in (0, None):
                     raise ConnecterError(body.get("ErrorMessage") or f"{type_} failed with status {body.get('Status')}")

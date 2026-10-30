@@ -2,6 +2,7 @@
 
 from __future__ import annotations
 
+import functools
 import os
 import re
 import shutil
@@ -10,6 +11,7 @@ import time
 from pathlib import Path
 
 from mcp.server.mcpserver import MCPServer
+from mcp.server.mcpserver.exceptions import ToolError
 
 from . import journal
 from .catalog import COMMANDS
@@ -30,6 +32,22 @@ mcp = MCPServer(
 client = ConnecterClient()
 index = FileIndex()
 GUID_RE = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$", re.I)
+
+
+def tool(fn):
+    """Register an MCP tool whose unexpected errors still reach the client with their message
+    (the SDK otherwise reports only 'Error executing tool')."""
+    @functools.wraps(fn)
+    def wrapper(*args, **kwargs):
+        try:
+            return fn(*args, **kwargs)
+        except ToolError:
+            raise
+        except Exception as e:
+            raise ToolError(f"{type(e).__name__}: {e}") from e
+
+    mcp.tool()(wrapper)
+    return wrapper
 
 
 # ---------------------------------------------------------------- helpers
@@ -79,7 +97,7 @@ def _backup(label: str) -> str | None:
 
 # ---------------------------------------------------------------- system
 
-@mcp.tool()
+@tool
 def connecter_status() -> dict:
     """Connecter's install, version, workspace, message folder, indexed root folders and asset counts."""
     client.refresh()
@@ -104,7 +122,7 @@ def connecter_status() -> dict:
     return status
 
 
-@mcp.tool()
+@tool
 def connecter_call(command: str, payload: dict | None = None, expect_reply: bool = True) -> dict:
     """Send any raw Connecter integration command (see list_commands) and return its reply payload.
     Use the dedicated tools when one exists; this is for commands they don't cover."""
@@ -114,7 +132,7 @@ def connecter_call(command: str, payload: dict | None = None, expect_reply: bool
     return client.request(command, payload or {})
 
 
-@mcp.tool()
+@tool
 def list_commands(group: str | None = None) -> dict:
     """List Connecter's integration commands and their request fields, optionally for one group."""
     if group:
@@ -122,8 +140,8 @@ def list_commands(group: str | None = None) -> dict:
     return COMMANDS
 
 
-@mcp.tool()
-def read_log(lines: int = 60, errors_only: bool = False) -> list[str]:
+@tool
+def read_log(lines: int = 60, errors_only: bool = False) -> dict:
     """Readable lines from the end of Connecter's log (errors, watcher overflows, unreadable files)."""
     data = client.paths.log_path.read_bytes()
     text = re.sub(r"[^\x20-\x7e\n]+", " ", data.decode("latin-1"))
@@ -131,10 +149,10 @@ def read_log(lines: int = 60, errors_only: bool = False) -> list[str]:
     out = [line for line in out if len(line) > 12]
     if errors_only:
         out = [line for line in out if re.search(r"error|exception|could not|failed", line, re.I)]
-    return out[-lines:]
+    return {"log": str(client.paths.log_path), "lines": out[-lines:]}
 
 
-@mcp.tool()
+@tool
 def restart_connecter(confirm: bool = False) -> dict:
     """Close Connecter gracefully and start it again from its normal working folder.
     Needs confirm=True. Use after a file-watcher overflow or when Connecter misbehaves."""
@@ -180,7 +198,7 @@ def _shortcut_dir() -> Path | None:
 
 # ---------------------------------------------------------------- assets
 
-@mcp.tool()
+@tool
 def search_assets(query: str = "", tag: str = "", folder: str = "", untagged: bool = False,
                   no_previews: bool = False, extension: str = "", limit: int = 50) -> dict:
     """Search catalogued assets by words in the path/description, tag (includes sub-tags),
@@ -205,7 +223,7 @@ def search_assets(query: str = "", tag: str = "", folder: str = "", untagged: bo
     return {"total": len(hits), "assets": hits[:limit]}
 
 
-@mcp.tool()
+@tool
 def get_asset(asset: str) -> dict:
     """Everything Connecter knows about one asset (path or GUID): tags, previews, description, custom properties."""
     info = _get_asset(asset)
@@ -219,7 +237,7 @@ def get_asset(asset: str) -> dict:
     return info
 
 
-@mcp.tool()
+@tool
 def catalogue_asset(asset_path: str, tags: list[str] | None = None, previews: list[str] | None = None,
                     description: str | None = None, auto_hide_previews: bool = True,
                     replace_tags: bool = False, replace_previews: bool = False) -> dict:
@@ -234,36 +252,50 @@ def catalogue_asset(asset_path: str, tags: list[str] | None = None, previews: li
         before["Description"] = client.request("GetAssetDescription", {"AssetGuid": before["Guid"]}).get("Description")
     except ConnecterError:
         pass
+    old_tags = {t["Guid"] for t in before["Tags"]} if before else set()
+    old_previews = [p["FileFullPath"] for p in before["CustomPreviews"]] if before else []
     if before and replace_tags:
         client.request("UntagAssetFromAllTags", {"AssetGuid": before["Guid"]})
+    # The CatalogueAsset message ignores RemoveOldPreviews, so clear them through the API instead.
+    if before and replace_previews and old_previews:
+        client.request("RemoveCustomPreviewsFromAsset", {"AssetGuid": before["Guid"], "PreviewGuids": [p["Guid"] for p in before["CustomPreviews"]]})
     payload = {"AssetFullPath": asset_path, "AutoHidePreviews": auto_hide_previews,
-               "RemoveOldPreviews": replace_previews, "RemoveOldTags": replace_tags,
                "Description": description if description is not None else (before or {}).get("Description") or "",
                "Previews": [{"FullPath": p} for p in previews or []], "Tags": [{"Guid": g} for g in guids]}
     if not client.drop_message("CatalogueAsset", payload):
         raise ConnecterError("Connecter did not pick up the message. Is it running?")
+    want_previews = {Path(p).name.lower() for p in previews or []}
     after = None
     for _ in range(20):
         time.sleep(0.5)
         try:
             after = _get_asset(asset_path)
-            if all(g in {t["Guid"] for t in after["Tags"]} for g in guids):
-                break
         except ConnecterError:
             continue
+        if set(guids) <= {t["Guid"] for t in after["Tags"]} and \
+                want_previews <= {Path(p["FileFullPath"]).name.lower() for p in after["CustomPreviews"]}:
+            break
     if not after:
         raise ConnecterError("Message sent, but Connecter does not report the asset yet")
-    added = [g for g in guids if not before or g not in {t["Guid"] for t in before["Tags"]}]
+    added = [g for g in guids if g not in old_tags]
+    # Tags gone afterwards: replaced on purpose, or displaced by a parent/child tag in the same branch.
+    removed = [g for g in old_tags if g not in {t["Guid"] for t in after["Tags"]}]
     undo = [{"type": "UntagAsset", "payload": {"AssetGuid": after["Guid"], "TagGuids": added}}] if added else []
+    if removed:
+        undo.append({"type": "TagAsset", "payload": {"AssetGuid": after["Guid"], "TagGuids": removed}})
     if before is not None and description is not None:
         undo.append({"type": "SetAssetDescription", "payload": {"AssetGuid": after["Guid"], "Description": before.get("Description") or ""}})
     if previews:
         undo.append({"type": "RemoveCustomPreviewsFromAsset", "payload": {"AssetGuid": after["Guid"], "PreviewFullPaths": previews}})
+    if replace_previews and old_previews:
+        undo.append({"type": "_message", "payload": {"Type": "AddPreviewsToAsset", "Payload": {
+            "AssetFullPath": after["FileFullPath"], "Previews": [{"FullPath": p} for p in old_previews],
+            "RemoveOldPreviews": False, "AutoHidePreviews": True}}})
     jid = journal.record("catalogue_asset", {"asset": asset_path, "tags": tags, "previews": previews, "description": description}, undo)
     return {"journal_id": jid, "asset": after}
 
 
-@mcp.tool()
+@tool
 def set_description(asset: str, description: str) -> dict:
     """Set an asset's description (searchable in Connecter)."""
     ref = _asset_ref(asset)
@@ -274,19 +306,48 @@ def set_description(asset: str, description: str) -> dict:
     return {"journal_id": jid, "old": old, "new": description}
 
 
-@mcp.tool()
+@tool
 def tag_assets(assets: list[str], tag: str) -> dict:
     """Add one tag (e.g. '06_LIGHTS/WALL LIGHTS') to several assets (paths or GUIDs)."""
-    guid = _tag_guid(tag)
+    tags = _tags()
+    guid = _tag_guid(tag, tags)
     paths = [a for a in assets if not GUID_RE.match(a)]
     guids = [a for a in assets if GUID_RE.match(a)]
-    r = client.request("TagAssets", {"TagGuid": guid, "AssetFullPaths": paths, "AssetGuids": guids})
-    jid = journal.record("tag_assets", {"assets": assets, "tag": tag},
-                         [{"type": "UntagAssets", "payload": {"TagGuid": guid, "AssetFullPaths": paths, "AssetGuids": guids}}])
-    return {"journal_id": jid, "tagged": r.get("TaggedAssetsCount")}
+    displaced = _displaced_tags(assets, guid, tags)
+    r = client.request("TagAssets", {"TagGuid": guid, "AssetFullPaths": paths, "AssetGuids": guids}, timeout=120)
+    undo = [{"type": "UntagAssets", "payload": {"TagGuid": guid, "AssetFullPaths": paths, "AssetGuids": guids}}]
+    undo += [{"type": "TagAsset", "payload": {**_asset_ref(a), "TagGuids": old}} for a, old in displaced.items()]
+    jid = journal.record("tag_assets", {"assets": assets, "tag": tag}, undo)
+    return {"journal_id": jid, "tagged": r.get("TaggedAssetsCount"),
+            "replaced_parent_or_child_tags": len(displaced)}
 
 
-@mcp.tool()
+def _tag_family(guid: str, tags: list[dict]) -> set[str]:
+    """Ancestors and descendants of a tag. Connecter lets an asset hold only one tag per branch, so
+    tagging with one of these replaces the other."""
+    path = next(t["TagPath"] for t in tags if t["Guid"] == guid)
+    n = len(path)
+    return {t["Guid"] for t in tags if t["Guid"] != guid
+            and (t["TagPath"][:n] == path or path[:len(t["TagPath"])] == t["TagPath"])}
+
+
+def _displaced_tags(assets: list[str], guid: str, tags: list[dict]) -> dict[str, list[str]]:
+    """Per asset, the tags that tagging with `guid` will replace (so undo can put them back)."""
+    family = _tag_family(guid, tags)
+    by_path = {"/".join(t["TagPath"]).lower(): t["Guid"] for t in tags}
+    with _db() as db:
+        current = {}
+        for a in db.assets():
+            current[a.path.lower()] = current[a.guid] = [by_path.get(p.lower()) for p in a.tags]
+    out = {}
+    for a in assets:
+        old = [g for g in current.get(a if GUID_RE.match(a) else a.lower(), []) if g in family]
+        if old:
+            out[a] = old
+    return out
+
+
+@tool
 def untag_assets(assets: list[str], tag: str) -> dict:
     """Remove one tag from several assets."""
     guid = _tag_guid(tag)
@@ -298,7 +359,7 @@ def untag_assets(assets: list[str], tag: str) -> dict:
     return {"journal_id": jid, "untagged": r.get("UntaggedAssetsCount")}
 
 
-@mcp.tool()
+@tool
 def set_previews(asset: str, images: list[str], replace: bool = False, auto_hide: bool = True) -> dict:
     """Attach preview images to an asset (first image becomes the thumbnail when replace=True).
     Source images are hidden from the asset grid unless auto_hide=False."""
@@ -314,7 +375,7 @@ def set_previews(asset: str, images: list[str], replace: bool = False, auto_hide
     return {"journal_id": jid, "previews": after}
 
 
-@mcp.tool()
+@tool
 def remove_previews(asset: str, images: list[str]) -> dict:
     """Detach preview images (by their original file path or preview GUID) from an asset."""
     guids = [i for i in images if GUID_RE.match(i)]
@@ -324,7 +385,7 @@ def remove_previews(asset: str, images: list[str]) -> dict:
     return r
 
 
-@mcp.tool()
+@tool
 def show_in_connecter(assets: list[str], isolate: bool = False) -> dict:
     """Bring Connecter to the front and select one asset, or isolate several in the grid."""
     if isolate or len(assets) > 1:
@@ -332,7 +393,7 @@ def show_in_connecter(assets: list[str], isolate: bool = False) -> dict:
     return client.request("LocateAsset", {"AssetFullPath": assets[0], "ActivateMainWindow": True})
 
 
-@mcp.tool()
+@tool
 def asset_properties(asset: str, set_name: str | None = None, set_value: str | None = None) -> dict:
     """Read an asset's custom properties, or set one (creates it on the asset if missing).
     The property definition must exist in Connecter (create it in Connecter or via connecter_call)."""
@@ -344,7 +405,7 @@ def asset_properties(asset: str, set_name: str | None = None, set_value: str | N
     return client.request("GetCustomPropertiesForAsset", ref)
 
 
-@mcp.tool()
+@tool
 def asset_versions(asset: str) -> dict:
     """Version-control history of an asset, if Connecter's versioning is used."""
     return client.request("GetAssetVersions", _asset_ref(asset))
@@ -352,9 +413,10 @@ def asset_versions(asset: str) -> dict:
 
 # ---------------------------------------------------------------- tags
 
-@mcp.tool()
-def list_tags(filter: str = "") -> list[dict]:
-    """The tag tree as paths with GUIDs and asset counts, optionally filtered by text."""
+@tool
+def list_tags(filter: str = "") -> dict:
+    """The tag tree as paths with GUIDs and the number of assets tagged directly with each,
+    optionally filtered by text."""
     with _db() as db:
         counts: dict[str, int] = {}
         for a in db.assets():
@@ -365,10 +427,10 @@ def list_tags(filter: str = "") -> list[dict]:
         path = "/".join(t["TagPath"])
         if filter.lower() in path.lower():
             out.append({"tag": path, "guid": t["Guid"], "assets": counts.get(path, 0)})
-    return sorted(out, key=lambda r: r["tag"])
+    return {"tags": sorted(out, key=lambda r: r["tag"])}
 
 
-@mcp.tool()
+@tool
 def create_tag(tag: str) -> dict:
     """Create a tag from a path, e.g. '09_MISC/LANDSCAPE' creates LANDSCAPE under 09_MISC."""
     parts = _tag_path(tag)
@@ -380,7 +442,7 @@ def create_tag(tag: str) -> dict:
     return {"journal_id": jid, "tag": t}
 
 
-@mcp.tool()
+@tool
 def rename_tag(tag: str, new_name: str) -> dict:
     """Rename a tag (keeps its assets)."""
     guid = _tag_guid(tag)
@@ -390,7 +452,7 @@ def rename_tag(tag: str, new_name: str) -> dict:
     return {"journal_id": jid, "renamed": True}
 
 
-@mcp.tool()
+@tool
 def move_tag(tag: str, new_parent: str = "") -> dict:
     """Move a tag under another tag ('' moves it to the top level)."""
     tags = _tags()
@@ -403,7 +465,7 @@ def move_tag(tag: str, new_parent: str = "") -> dict:
     return {"journal_id": jid, "moved": True}
 
 
-@mcp.tool()
+@tool
 def delete_tag(tag: str, confirm: bool = False) -> dict:
     """Delete a tag. Its assets stay in the library but lose this tag. Needs confirm=True.
     The assets it held are journaled so `undo` can recreate the tag and re-tag them."""
@@ -418,43 +480,75 @@ def delete_tag(tag: str, confirm: bool = False) -> dict:
     return {"journal_id": jid, "deleted": tag, "assets_untagged": len(held)}
 
 
-@mcp.tool()
+# Connecter only accepts colours from its own palette; these are confirmed to work in Connecter 8.0.
+TAG_COLORS = {"cyan": "#FF8FEEE8", "purple": "#FFC19DF2", "lavender": "#FFD5BCF6",
+              "yellow": "#FFF6F7A4", "pink": "#FFFFABAB", "white": "#FFFFFFFF"}
+
+
+@tool
 def set_tag_color(tag: str, color: str | None = None, apply_to_subtags: bool = False) -> dict:
-    """Set a tag's colour as '#RRGGBB' (or None to remove it)."""
+    """Set a tag's colour, or remove it with color=None. Connecter only accepts its palette colours:
+    cyan, purple, lavender, yellow, pink, white (or a palette '#AARRGGBB' value)."""
     guid = _tag_guid(tag)
     if color is None:
         return client.request("RemoveTagColor", {"TagGuid": guid})
-    argb = color if len(color) == 9 else "#FF" + color.lstrip("#")
-    return client.request("ChangeTagColor", {"TagGuid": guid, "Color": argb, "ApplyOnSubtags": apply_to_subtags})
+    argb = TAG_COLORS.get(color.lower()) or (color if len(color) == 9 else "#FF" + color.lstrip("#")).upper()
+    try:
+        return client.request("ChangeTagColor", {"TagGuid": guid, "Color": argb, "ApplyOnSubtags": apply_to_subtags})
+    except ConnecterError as e:
+        raise ConnecterError(f"{e}. Connecter only accepts its palette colours: {', '.join(TAG_COLORS)}") from e
 
 
 # ---------------------------------------------------------------- files and folders
 
-@mcp.tool()
+@tool
 def move_asset(asset: str, to_folder: str, new_file_name: str | None = None) -> dict:
     """Move an asset file through Connecter so its tags, previews and description follow it."""
     info = _get_asset(asset)
-    payload = {"AssetGuid": info["Guid"], "FolderFullPath": to_folder}
-    if new_file_name:
-        payload["NewAssetFileName"] = new_file_name
-    r = client.request("MoveAssetInFileSystem", payload)
     old = Path(info["FileFullPath"])
-    jid = journal.record("move_asset", {"from": str(old), "to": r.get("NewAssetFullPath")},
-                         [{"type": "MoveAssetInFileSystem", "payload": {"AssetGuid": info["Guid"], "FolderFullPath": str(old.parent), "NewAssetFileName": old.name}}])
-    return {"journal_id": jid, **r}
+    r = client.request("MoveAssetInFileSystem", {"AssetGuid": info["Guid"], "FolderFullPath": to_folder})
+    moved = Path(r.get("NewAssetFullPath") or Path(to_folder) / old.name)
+    undo = [{"type": "MoveAssetInFileSystem", "payload": {"AssetGuid": info["Guid"], "FolderFullPath": str(old.parent)}}]
+    if new_file_name:
+        renamed = moved.with_name(_with_suffix(new_file_name, old))
+        _rename_file(moved, renamed)
+        undo.insert(0, {"type": "_rename_file", "payload": {"from": str(renamed), "to": str(moved)}})
+        moved = renamed
+    jid = journal.record("move_asset", {"from": str(old), "to": str(moved)}, undo)
+    return {"journal_id": jid, "new_path": str(moved)}
 
 
-@mcp.tool()
+@tool
 def rename_asset(asset: str, new_name: str) -> dict:
-    """Rename an asset file through Connecter (keeps its catalogue data). new_name without folder."""
-    info = _get_asset(asset)
-    r = client.request("RenameAssetInFileSystem", {"AssetGuid": info["Guid"], "NewAssetName": new_name})
-    jid = journal.record("rename_asset", {"asset": info["FileFullPath"], "new_name": new_name},
-                         [{"type": "RenameAssetInFileSystem", "payload": {"AssetGuid": info["Guid"], "NewAssetName": Path(info["FileFullPath"]).stem}}])
-    return {"journal_id": jid, **r}
+    """Rename an asset file through Connecter (keeps its catalogue data). new_name is the file name
+    without folder; the extension is kept if you leave it out."""
+    old = Path(_get_asset(asset)["FileFullPath"])
+    new = old.with_name(_with_suffix(new_name, old))
+    _rename_file(old, new)
+    jid = journal.record("rename_asset", {"asset": str(old), "new_path": str(new)},
+                         [{"type": "_rename_file", "payload": {"from": str(new), "to": str(old)}}])
+    return {"journal_id": jid, "new_path": str(new)}
 
 
-@mcp.tool()
+def _with_suffix(name: str, original: str | Path) -> str:
+    suffix = Path(original).suffix
+    return name if name.lower().endswith(suffix.lower()) else name + suffix
+
+
+def _rename_file(old: Path, new: Path) -> None:
+    """Rename on disk, then point the catalogue entry at the new name.
+    (Connecter 8.0's own RenameAssetInFileSystem drops the file extension.)"""
+    if new.exists():
+        raise ConnecterError(f"{new} already exists")
+    old.rename(new)
+    try:
+        client.request("RelocateAsset", {"AssetFullPath": str(old), "NewAssetFullPath": str(new)})
+    except ConnecterError:
+        new.rename(old)
+        raise
+
+
+@tool
 def folder_operation(operation: str, folder: str, target: str = "", confirm: bool = False) -> dict:
     """Folder operations through Connecter so catalogue data follows: operation is 'create', 'rename'
     (target = new name), 'move' (target = new parent folder), 'copy' (target = parent folder) or
@@ -481,7 +575,7 @@ def folder_operation(operation: str, folder: str, target: str = "", confirm: boo
 
 # ---------------------------------------------------------------- library ingestion
 
-@mcp.tool()
+@tool
 def library_categories() -> dict:
     """The library's category folders (from models_dir in the config) and the tag tree, so you can
     choose where a new model belongs."""
@@ -492,11 +586,11 @@ def library_categories() -> dict:
             subs = sorted(p.name for p in c.iterdir() if p.is_dir() and not any(f.suffix.lower() in MODEL_EXTS for f in p.iterdir() if f.is_file()))
             cats.append({"category": c.name, "subcategories": subs})
     return {"models_dir": str(s.models_dir) if s.models_dir else None, "categories": cats,
-            "tags": [t["tag"] for t in list_tags()],
+            "tags": [t["tag"] for t in list_tags()["tags"]],
             "note": None if s.models_dir else f"Set models_dir in {CONFIG_FILE} to enable categories."}
 
 
-@mcp.tool()
+@tool
 def inspect_folder(folder: str) -> dict:
     """Look inside a downloaded model folder: model files, which images are previews vs texture maps,
     and the textures each .max uses (with missing ones flagged)."""
@@ -509,7 +603,7 @@ def inspect_folder(folder: str) -> dict:
     return {"models": models, **images, "max_textures": textures}
 
 
-@mcp.tool()
+@tool
 def ingest_model(source_folder: str, category: str, model_name: str | None = None, tag: str | None = None,
                  description: str | None = None, move: bool = True, dry_run: bool = True) -> dict:
     """Bring a downloaded model into the library in one step: move (or copy) the folder to
@@ -558,7 +652,7 @@ def ingest_model(source_folder: str, category: str, model_name: str | None = Non
 
 # ---------------------------------------------------------------- health
 
-@mcp.tool()
+@tool
 def audit_library(include_textures: bool = False, limit: int = 30) -> dict:
     """Library health report: untagged assets, assets without previews, missing files, unused preview
     images, and (include_textures=True, slower) .max files with missing texture maps."""
@@ -593,19 +687,23 @@ def audit_library(include_textures: bool = False, limit: int = 30) -> dict:
     return report
 
 
-@mcp.tool()
+@tool
 def find_missing_assets(folder: str = "", find_candidates: bool = True) -> dict:
     """Catalogued assets whose file is gone (moved, renamed or deleted outside Connecter), with
     likely new locations found by name across the root folders and configured search_dirs."""
     with _db() as db:
-        missing = [a for a in db.assets() if not Path(a.path).exists() and a.path.lower().startswith(folder.lower())]
+        assets = db.assets()
+    missing = [a for a in assets if not Path(a.path).exists() and a.path.lower().startswith(folder.lower())]
+    # A file that already has its own catalogue entry is a different asset, not where this one went.
+    catalogued = {a.path.lower() for a in assets}
     roots = _search_roots() if find_candidates else []
     out = []
     for a in missing:
         entry = {**a.to_dict()}
         if find_candidates:
             # Rank every same-named file before trimming, or the right copy can be cut off.
-            entry["candidates"] = _rank_by_folders(a.path, index.find(roots, Path(a.path).name, limit=200))[:8]
+            found = [c for c in index.find(roots, Path(a.path).name, limit=200) if c["path"].lower() not in catalogued]
+            entry["candidates"] = _rank_by_folders(a.path, found)[:8]
         out.append(entry)
     return {"missing_count": len(out), "assets": out}
 
@@ -623,7 +721,7 @@ def _rank_by_folders(original: str, candidates: list[dict]) -> list[dict]:
     return sorted(candidates, key=lambda c: -c["confidence"])
 
 
-@mcp.tool()
+@tool
 def relocate_asset(asset: str, new_path: str) -> dict:
     """Point a missing (or moved) catalogue entry at the file's new location, keeping its tags,
     previews and description. Does not move any file."""
@@ -637,7 +735,7 @@ def relocate_asset(asset: str, new_path: str) -> dict:
     return {"journal_id": jid, "relocated": info["FileFullPath"], "to": new_path}
 
 
-@mcp.tool()
+@tool
 def batch_relocate(min_confidence: float = 0.9, folder: str = "", dry_run: bool = True) -> dict:
     """Relocate every missing asset whose best candidate is unambiguous and at least min_confidence.
     dry_run=True (default) only lists what would change and what needs a manual decision."""
@@ -669,7 +767,7 @@ def _texture_status(path: str, max_file: Path) -> dict:
     return {"path": path, "status": "missing", "resolved": None}
 
 
-@mcp.tool()
+@tool
 def scan_textures(asset: str = "", folder: str = "", tag: str = "", only_missing: bool = True, limit: int = 100) -> dict:
     """Texture maps used by .max assets (one asset, a folder, or a tag) and whether each resolves.
     'found_by_name' means the stored path is wrong but 3ds Max will still find the file next to the scene."""
@@ -689,7 +787,7 @@ def scan_textures(asset: str = "", folder: str = "", tag: str = "", only_missing
     return {"files_scanned": min(len(files), limit), "files_with_issues": len(out), "results": out}
 
 
-@mcp.tool()
+@tool
 def find_texture_candidates(asset: str, extra_folders: list[str] | None = None) -> dict:
     """For each missing map of a .max asset, search the asset folder, the library roots, search_dirs and
     extra_folders by exact name, other extensions and similar names. Returns ranked candidates."""
@@ -702,7 +800,7 @@ def find_texture_candidates(asset: str, extra_folders: list[str] | None = None) 
     return {"asset": str(max_file), "missing": result}
 
 
-@mcp.tool()
+@tool
 def localize_textures(asset: str, choices: dict[str, str] | None = None, min_confidence: float = 0.9,
                       dry_run: bool = True) -> dict:
     """Fix missing maps without opening 3ds Max: copy the found file next to the .max (3ds Max resolves
@@ -726,7 +824,7 @@ def localize_textures(asset: str, choices: dict[str, str] | None = None, min_con
     return {"journal_id": jid, "copied": plan, "unresolved": skipped}
 
 
-@mcp.tool()
+@tool
 def relink_script(asset: str, choices: dict[str, str] | None = None, make_relative: bool = True) -> dict:
     """MaxScript that rewrites a .max file's missing bitmap paths to the found files (or, with
     make_relative, to bare file names - run localize_textures first so they sit next to the scene).
@@ -749,20 +847,20 @@ def relink_script(asset: str, choices: dict[str, str] | None = None, make_relati
 
 # ---------------------------------------------------------------- safety
 
-@mcp.tool()
+@tool
 def backup_workspace(label: str = "manual") -> dict:
     """Snapshot Connecter's workspace database to ~/.connecter-mcp/backups."""
     return {"backup": _backup(label), "all_backups": journal.list_backups()[:10]}
 
 
-@mcp.tool()
-def change_journal(limit: int = 20) -> list[dict]:
+@tool
+def change_journal(limit: int = 20) -> dict:
     """Recent changes made through this MCP, newest first, with their journal IDs for `undo`."""
-    return [{k: e[k] for k in ("id", "time", "action", "details", "undone")} | {"undoable": bool(e["undo"])}
-            for e in reversed(journal.entries()[-limit:])]
+    return {"changes": [{k: e[k] for k in ("id", "time", "action", "details", "undone")} | {"undoable": bool(e["undo"])}
+                        for e in reversed(journal.entries()[-limit:])]}
 
 
-@mcp.tool()
+@tool
 def undo(journal_id: str) -> dict:
     """Reverse a change recorded in the journal (tags, descriptions, previews, moves, relocations, tag edits)."""
     entry = next((e for e in journal.entries() if e["id"] == journal_id), None)
@@ -777,6 +875,11 @@ def undo(journal_id: str) -> dict:
             t = create_tag(step["payload"]["tag"])
             if step["payload"]["assets"]:
                 client.request("TagAssets", {"TagGuid": t["tag"]["Guid"], "AssetFullPaths": step["payload"]["assets"]})
+        elif step["type"] == "_rename_file":
+            _rename_file(Path(step["payload"]["from"]), Path(step["payload"]["to"]))
+        elif step["type"] == "_message":
+            client.drop_message(step["payload"]["Type"], step["payload"]["Payload"])
+            time.sleep(1.5)
         else:
             client.request(step["type"], step["payload"])
     journal.mark_undone(journal_id)

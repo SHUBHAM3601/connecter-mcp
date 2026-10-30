@@ -77,6 +77,21 @@ launch_dir = 'C:\Users\you\Documents\Design Connected\Connecter\Sample Products'
 * *"Why does this model render without its normal map?"* → `scan_textures`, `find_texture_candidates`, `localize_textures`
 * *"Make a LANDSCAPE tag under 09_MISC and move the pebbles into it."* → `create_tag`, `tag_assets`, `untag_assets`
 
+## Testing
+
+`tests/live_test.py` exercises every tool through the MCP layer against a running Connecter. It works on a throwaway copy of one model in `<models_dir>/<category>/_MCP_TEST` and removes it afterwards:
+
+```bash
+uv run python tests/live_test.py "D:\Library\3D MODELS\09_MISC\Some Model"
+```
+
+## Connecter behaviours worth knowing
+
+* **One tag per branch.** An asset can't hold a tag and its own parent or child tag. Tagging with one replaces the other, and `tag_assets` reports how many it replaced (and `undo` puts them back). Sibling tags and tags in other branches can be combined freely.
+* **Tag colours** must come from Connecter's palette: `cyan`, `purple`, `lavender`, `yellow`, `pink`, `white`.
+* **Renaming assets.** Connecter 8.0's own rename drops the file extension, so `rename_asset` renames on disk and re-points the catalogue entry instead.
+* **Custom properties and versions** are only available in some Connecter workspaces; on others these tools say so.
+
 ## Notes
 
 * Built against Connecter 8.0. Integration commands are discovered from Connecter's public plugin behaviour; a Connecter update can change them. Run `connecter_status` after updating.

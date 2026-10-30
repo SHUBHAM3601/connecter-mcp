@@ -15,7 +15,7 @@ from . import journal
 from .client import ConnecterError
 from .config import HOME_DIR, Settings
 from .files import MODEL_EXTS, classify_images
-from .server import (GUID_RE, _backup, _close_connecter, _db, _get_asset, _launch_connecter, _tag_guid,
+from .server import (GUID_RE, tool, _backup, _tag_family, _close_connecter, _db, _get_asset, _launch_connecter, _tag_guid,
                      _tag_path, _tags, client, create_tag, find_missing_assets, mcp, relocate_asset, set_previews)
 
 TESTED_VERSION = "8.0"
@@ -51,7 +51,7 @@ def _model_files(folder: Path, extensions: list[str]) -> list[Path]:
 
 # ---------------------------------------------------------------- tags
 
-@mcp.tool()
+@tool
 def sync_tags_to_folders(folder: str = "", extensions: list[str] | None = None, only_untagged: bool = True,
                          include_uncatalogued: bool = False, dry_run: bool = True) -> dict:
     """Tag models with the tag that matches their library folder, e.g. a .max under
@@ -102,7 +102,7 @@ def sync_tags_to_folders(folder: str = "", extensions: list[str] | None = None, 
     return {"tagged": tagged, "by_tag": summary}
 
 
-@mcp.tool()
+@tool
 def restructure_taxonomy(mapping: dict[str, str], delete_old_tags: bool = False, dry_run: bool = True) -> dict:
     """Move assets between tags in bulk: mapping is {old tag: new tag}, e.g.
     {'09_MISC': '09_MISC/LANDSCAPE'} or {'03_DECOR/BOOKS': '03_DECOR/DECORATIVE SET'}. New tags (and parents)
@@ -125,15 +125,18 @@ def restructure_taxonomy(mapping: dict[str, str], delete_old_tags: bool = False,
     for p in plan:
         new_guid = _ensure_tag(p["to"], tags)
         old_guid = _tag_guid(p["from"], tags)
+        # Within one branch Connecter keeps a single tag per asset: tagging with the new tag already
+        # replaces the old one, and untagging the old one afterwards would strip the new one too.
+        same_branch = old_guid in _tag_family(new_guid, tags)
         if p["paths"]:
             client.request("TagAssets", {"TagGuid": new_guid, "AssetFullPaths": p["paths"]}, timeout=120)
-            client.request("UntagAssets", {"TagGuid": old_guid, "AssetFullPaths": p["paths"]}, timeout=120)
-        undo = [{"type": "TagAssets", "payload": {"TagGuid": old_guid, "AssetFullPaths": p["paths"]}},
-                {"type": "UntagAssets", "payload": {"TagGuid": new_guid, "AssetFullPaths": p["paths"]}}]
+            if not same_branch:
+                client.request("UntagAssets", {"TagGuid": old_guid, "AssetFullPaths": p["paths"]}, timeout=120)
+        untag_new = [] if same_branch else [{"type": "UntagAssets", "payload": {"TagGuid": new_guid, "AssetFullPaths": p["paths"]}}]
+        undo = untag_new + [{"type": "TagAssets", "payload": {"TagGuid": old_guid, "AssetFullPaths": p["paths"]}}]
         if p["delete_old"]:
             client.request("DeleteTag", {"TagGuid": old_guid})
-            undo = [{"type": "_recreate_tag", "payload": {"tag": p["from"], "assets": p["paths"]}},
-                    {"type": "UntagAssets", "payload": {"TagGuid": new_guid, "AssetFullPaths": p["paths"]}}]
+            undo = untag_new + [{"type": "_recreate_tag", "payload": {"tag": p["from"], "assets": p["paths"]}}]
         jid = journal.record("restructure_taxonomy", {"from": p["from"], "to": p["to"], "assets": len(p["paths"])}, undo)
         done.append({"from": p["from"], "to": p["to"], "moved": len(p["paths"]), "deleted_old": p["delete_old"], "journal_id": jid})
     return {"done": done}
@@ -141,7 +144,7 @@ def restructure_taxonomy(mapping: dict[str, str], delete_old_tags: bool = False,
 
 # ---------------------------------------------------------------- previews and files
 
-@mcp.tool()
+@tool
 def attach_folder_previews(folder: str = "", tag: str = "", max_previews: int = 3, dry_run: bool = True) -> dict:
     """For catalogued .max models with no previews, attach preview images found in the model's own folder
     (texture maps are excluded). Folders holding more than two .max files (bundles) are skipped, since their
@@ -176,7 +179,7 @@ def attach_folder_previews(folder: str = "", tag: str = "", max_previews: int = 
     return {"attached": len(plan), "skipped": dict(skipped)}
 
 
-@mcp.tool()
+@tool
 def orphan_cleanup(dry_run: bool = True) -> dict:
     """Preview images in the workspace's Media/previews folder that no asset uses any more. With
     dry_run=False they are moved (not deleted) to Media/previews_orphaned_<date> so they can be restored."""
@@ -197,7 +200,7 @@ def orphan_cleanup(dry_run: bool = True) -> dict:
     return {"moved": len(orphans), "size_mb": size_mb, "to": str(dest)}
 
 
-@mcp.tool()
+@tool
 def rename_cleanly(folder: str = "", dry_run: bool = True) -> dict:
     """Strip download-site junk from model folder names ('Pro 3DSky - X', 'X (3dline.net)', '3ddd - X') by
     renaming through Connecter, so tags and previews stay attached. Skips names that would collide.
@@ -224,7 +227,7 @@ def rename_cleanly(folder: str = "", dry_run: bool = True) -> dict:
     return {"renamed": len(done), "collisions": collisions}
 
 
-@mcp.tool()
+@tool
 def rescan(folder: str, extensions: list[str] | None = None) -> dict:
     """Tell Connecter about model files in a folder (and sub-folders) so they show up even when its file
     watcher missed them (its log often shows 'Too many changes at once'). Connecter gives no reply to this
@@ -235,7 +238,7 @@ def rescan(folder: str, extensions: list[str] | None = None) -> dict:
     return {"notified": len(files), "folder": folder}
 
 
-@mcp.tool()
+@tool
 def ingest_queue(folder: str = "") -> dict:
     """Downloads waiting to go into the library: folders (and archives) in the downloads folder that contain
     model files, with model, preview and texture counts. Use ingest_model to bring one in."""
@@ -271,7 +274,7 @@ def _quick_hash(path: Path) -> str:
     return h.hexdigest()
 
 
-@mcp.tool()
+@tool
 def find_duplicates(folder: str = "", extensions: list[str] | None = None, limit: int = 50) -> dict:
     """Identical model files saved in more than one place (same size and content), with their tags and
     previews so you can decide which copy to keep. Defaults to models_dir and '.max'."""
@@ -302,7 +305,7 @@ def find_duplicates(folder: str = "", extensions: list[str] | None = None, limit
     return {"duplicate_groups": len(dupes), "wasted_mb": round(wasted, 1), "groups": dupes[:limit]}
 
 
-@mcp.tool()
+@tool
 def library_stats(include_disk_size: bool = False) -> dict:
     """Breakdown per library category: model files on disk, catalogued, tagged, with previews, renderer
     (guessed from names) and optionally disk size. Needs models_dir in the config."""
@@ -328,7 +331,7 @@ def library_stats(include_disk_size: bool = False) -> dict:
 
 # ---------------------------------------------------------------- missing assets
 
-@mcp.tool()
+@tool
 def relocate_folder(old_folder: str, new_folder: str, dry_run: bool = True) -> dict:
     """A whole folder was moved or renamed outside Connecter: point every catalogued asset under
     old_folder at the same relative path under new_folder (only where that file exists).
@@ -350,7 +353,7 @@ def relocate_folder(old_folder: str, new_folder: str, dry_run: bool = True) -> d
     return {"relocated": len(plan), "not_found": not_found}
 
 
-@mcp.tool()
+@tool
 def resolve_deleted(folder: str = "", archive: bool = False) -> dict:
     """Missing assets with no file found anywhere (truly deleted). Lists what each one still holds (tags,
     previews, description). With archive=True, assets that hold tags have their data saved to
@@ -378,7 +381,7 @@ def resolve_deleted(folder: str = "", archive: bool = False) -> dict:
 
 # ---------------------------------------------------------------- system
 
-@mcp.tool()
+@tool
 def self_test() -> dict:
     """Check that everything this MCP relies on still works (useful after a Connecter update): the API,
     the message folder, the database layout and the journal. Write tools may misbehave if any check fails."""
@@ -417,7 +420,7 @@ def self_test() -> dict:
     return {"passed": all(c["ok"] for c in checks), "checks": checks}
 
 
-@mcp.tool()
+@tool
 def restore_workspace(backup: str, confirm: bool = False) -> dict:
     """Put a workspace database backup (a name from backup_workspace's list) back in place. Closes
     Connecter, saves the current database as a 'pre-restore' backup, copies the backup in and restarts
