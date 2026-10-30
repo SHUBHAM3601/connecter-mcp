@@ -619,9 +619,10 @@ def relocate_asset(asset: str, new_path: str) -> dict:
     if not Path(new_path).exists():
         raise ConnecterError(f"{new_path} does not exist")
     info = _get_asset(asset)
-    client.request("RelocateAsset", {"AssetGuid": info["Guid"], "NewAssetFullPath": new_path})
+    # Connecter rejects a GUID-only RelocateAsset for missing files ("extension doesn't match"); it needs the old path.
+    client.request("RelocateAsset", {"AssetFullPath": info["FileFullPath"], "NewAssetFullPath": new_path})
     jid = journal.record("relocate_asset", {"from": info["FileFullPath"], "to": new_path},
-                         [{"type": "RelocateAsset", "payload": {"AssetGuid": info["Guid"], "NewAssetFullPath": info["FileFullPath"]}}])
+                         [{"type": "RelocateAsset", "payload": {"AssetFullPath": new_path, "NewAssetFullPath": info["FileFullPath"]}}])
     return {"journal_id": jid, "relocated": info["FileFullPath"], "to": new_path}
 
 
