@@ -286,7 +286,7 @@ def catalogue_asset(asset_path: str, tags: list[str] | None = None, previews: li
     if before is not None and description is not None:
         undo.append({"type": "SetAssetDescription", "payload": {"AssetGuid": after["Guid"], "Description": before.get("Description") or ""}})
     if previews:
-        undo.append({"type": "RemoveCustomPreviewsFromAsset", "payload": {"AssetGuid": after["Guid"], "PreviewFullPaths": previews}})
+        undo.append({"type": "_remove_previews", "payload": {"AssetGuid": after["Guid"], "paths": previews}})
     if replace_previews and old_previews:
         undo.append({"type": "_message", "payload": {"Type": "AddPreviewsToAsset", "Payload": {
             "AssetFullPath": after["FileFullPath"], "Previews": [{"FullPath": p} for p in old_previews],
@@ -371,18 +371,29 @@ def set_previews(asset: str, images: list[str], replace: bool = False, auto_hide
     time.sleep(1.5)
     after = client.request("GetAssetCustomPreviews", {"AssetGuid": info["Guid"]})["CustomPreviews"]
     jid = journal.record("set_previews", {"asset": asset, "images": images, "replace": replace},
-                         [{"type": "RemoveCustomPreviewsFromAsset", "payload": {"AssetGuid": info["Guid"], "PreviewFullPaths": images}}])
+                         [{"type": "_remove_previews", "payload": {"AssetGuid": info["Guid"], "paths": images}}])
     return {"journal_id": jid, "previews": after}
 
 
 @tool
 def remove_previews(asset: str, images: list[str]) -> dict:
     """Detach preview images (by their original file path or preview GUID) from an asset."""
+    info = _get_asset(asset)
     guids = [i for i in images if GUID_RE.match(i)]
-    paths = [i for i in images if not GUID_RE.match(i)]
-    r = client.request("RemoveCustomPreviewsFromAsset", {**_asset_ref(asset), "PreviewGuids": guids, "PreviewFullPaths": paths})
+    removed = _remove_preview_links(info["Guid"], [i for i in images if not GUID_RE.match(i)], guids)
     journal.record("remove_previews", {"asset": asset, "images": images})
-    return r
+    return {"removed": removed}
+
+
+def _remove_preview_links(asset_guid: str, paths: list[str], guids: list[str] | None = None) -> int:
+    """Detach previews by their source path. Connecter rejects paths in RemoveCustomPreviewsFromAsset
+    ('invalid asset paths'), so match them to preview GUIDs first."""
+    want = {str(Path(p)).lower() for p in paths}
+    current = client.request("GetAssetCustomPreviews", {"AssetGuid": asset_guid})["CustomPreviews"]
+    guids = list(guids or []) + [p["Guid"] for p in current if p["FileFullPath"].lower() in want]
+    if guids:
+        client.request("RemoveCustomPreviewsFromAsset", {"AssetGuid": asset_guid, "PreviewGuids": guids})
+    return len(guids)
 
 
 @tool
@@ -862,7 +873,8 @@ def change_journal(limit: int = 20) -> dict:
 
 @tool
 def undo(journal_id: str) -> dict:
-    """Reverse a change recorded in the journal (tags, descriptions, previews, moves, relocations, tag edits)."""
+    """Reverse a change recorded in the journal (tags, descriptions, previews, moves, relocations, tag edits,
+    and files changed on disk such as relinked .max files or resized textures, which are restored from backups)."""
     entry = next((e for e in journal.entries() if e["id"] == journal_id), None)
     if not entry:
         raise ConnecterError(f"No journal entry {journal_id}")
@@ -877,6 +889,12 @@ def undo(journal_id: str) -> dict:
                 client.request("TagAssets", {"TagGuid": t["tag"]["Guid"], "AssetFullPaths": step["payload"]["assets"]})
         elif step["type"] == "_rename_file":
             _rename_file(Path(step["payload"]["from"]), Path(step["payload"]["to"]))
+        elif step["type"] == "_remove_previews" or (step["type"] == "RemoveCustomPreviewsFromAsset" and "PreviewFullPaths" in step["payload"]):
+            pl = step["payload"]
+            _remove_preview_links(pl["AssetGuid"], pl.get("paths") or pl.get("PreviewFullPaths") or [])
+        elif step["type"] == "_restore_file":
+            # A file changed on disk (a .max, a texture, a material library): copy the saved original back.
+            shutil.copy2(step["payload"]["backup"], step["payload"]["target"])
         elif step["type"] == "_message":
             client.drop_message(step["payload"]["Type"], step["payload"]["Payload"])
             time.sleep(1.5)
@@ -886,7 +904,7 @@ def undo(journal_id: str) -> dict:
     return {"undone": journal_id, "action": entry["action"]}
 
 
-from . import maintenance  # noqa: E402,F401  registers the maintenance tools on `mcp`
+from . import maintenance, maxtools, ai, library, projects, automation  # noqa: E402,F401  register more tools on `mcp`
 
 
 def main() -> None:

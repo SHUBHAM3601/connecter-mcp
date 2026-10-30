@@ -12,3 +12,10 @@ search_dirs = []
 # Working folder Connecter is normally started from; used by restart_connecter.
 # Defaults to the working folder of Connecter's Start-menu shortcut.
 # launch_dir = 'C:\Users\you\Documents\Design Connected\Connecter\Sample Products'
+
+# 3ds Max install folder for headless jobs (relinking, conversions, proxies). Defaults to the newest installed version.
+# max_dir = 'C:\Program Files\Autodesk\3ds Max 2024'
+
+# Headless 3ds Max jobs wait their turn while 3ds Max is busy (e.g. rendering): they are refused when
+# 3ds Max uses more CPU than this, in % of one core. Pass force=True to run anyway.
+# max_busy_cpu = 150

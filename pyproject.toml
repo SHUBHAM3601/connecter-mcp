@@ -1,6 +1,6 @@
 [project]
 name = "connecter-mcp"
-version = "0.1.0"
+version = "0.2.0"
 description = "MCP server for Design Connected's Connecter asset manager: search, tag, catalogue, ingest, audit, relocate and fix textures from any MCP client."
 readme = "README.md"
 license = { text = "MIT" }
@@ -8,6 +8,9 @@ requires-python = ">=3.11"
 dependencies = [
     "mcp>=2.3,<3",
     "olefile>=0.47",
+    "openpyxl>=3.1",
+    "pillow>=10",
+    "psutil>=5.9",
 ]
 
 [project.scripts]

@@ -22,9 +22,9 @@ from connecter_mcp.config import Settings
 RESULTS: list[tuple[str, bool, str]] = []
 
 
-def call(name: str, **args):
+def call(tool_name: str, /, **args):
     """Call a tool through the MCP layer (exercises argument validation, errors and serialisation)."""
-    result = asyncio.run(s.mcp.call_tool(name, args))
+    result = asyncio.run(s.mcp.call_tool(tool_name, args))
     text = result.content[0].text if result.content else "null"
     try:
         return json.loads(text)
