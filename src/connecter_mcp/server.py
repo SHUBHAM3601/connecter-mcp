@@ -140,22 +140,32 @@ def restart_connecter(confirm: bool = False) -> dict:
     Needs confirm=True. Use after a file-watcher overflow or when Connecter misbehaves."""
     if not confirm:
         return {"dry_run": True, "message": "Call again with confirm=True to restart Connecter."}
-    exe = client.paths.exe
-    if not exe or not exe.exists():
-        raise ConnecterError("Connecter.exe not found")
+    if not _close_connecter():
+        return {"restarted": False, "message": "Connecter did not close (a dialog may be open). Close it manually and retry."}
+    return {"restarted": True, **_launch_connecter()}
+
+
+def _close_connecter() -> bool:
+    """Ask Connecter to close like clicking X; True once it has exited."""
     subprocess.run(["powershell", "-NoProfile", "-Command",
                     "$p=Get-Process Connecter -ErrorAction SilentlyContinue; if($p){[void]$p.CloseMainWindow(); $p.WaitForExit(45000)|Out-Null}"],
                    check=False, capture_output=True)
-    if subprocess.run(["powershell", "-NoProfile", "-Command", "[bool](Get-Process Connecter -ErrorAction SilentlyContinue)"],
-                      capture_output=True, text=True).stdout.strip() == "True":
-        return {"restarted": False, "message": "Connecter did not close (a dialog may be open). Close it manually and retry."}
+    return subprocess.run(["powershell", "-NoProfile", "-Command", "[bool](Get-Process Connecter -ErrorAction SilentlyContinue)"],
+                          capture_output=True, text=True).stdout.strip() != "True"
+
+
+def _launch_connecter() -> dict:
+    """Start Connecter from its normal working folder (elsewhere, its 3ds Max integration check fails)."""
+    exe = client.paths.exe
+    if not exe or not exe.exists():
+        raise ConnecterError("Connecter.exe not found")
     launch_dir = Settings.load().launch_dir or _shortcut_dir() or exe.parent
     subprocess.Popen([str(exe)], cwd=str(launch_dir), creationflags=subprocess.DETACHED_PROCESS)
     for _ in range(60):
         time.sleep(1)
         if client.is_running():
-            return {"restarted": True, "working_dir": str(launch_dir)}
-    return {"restarted": True, "working_dir": str(launch_dir), "message": "Started, but the API is not answering yet."}
+            return {"working_dir": str(launch_dir)}
+    return {"working_dir": str(launch_dir), "message": "Started, but the API is not answering yet."}
 
 
 def _shortcut_dir() -> Path | None:
@@ -594,7 +604,8 @@ def find_missing_assets(folder: str = "", find_candidates: bool = True) -> dict:
     for a in missing:
         entry = {**a.to_dict()}
         if find_candidates:
-            entry["candidates"] = _rank_by_folders(a.path, index.find(roots, Path(a.path).name))
+            # Rank every same-named file before trimming, or the right copy can be cut off.
+            entry["candidates"] = _rank_by_folders(a.path, index.find(roots, Path(a.path).name, limit=200))[:8]
         out.append(entry)
     return {"missing_count": len(out), "assets": out}
 
@@ -770,6 +781,9 @@ def undo(journal_id: str) -> dict:
             client.request(step["type"], step["payload"])
     journal.mark_undone(journal_id)
     return {"undone": journal_id, "action": entry["action"]}
+
+
+from . import maintenance  # noqa: E402,F401  registers the maintenance tools on `mcp`
 
 
 def main() -> None:

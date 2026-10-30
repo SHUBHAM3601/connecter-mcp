@@ -8,14 +8,15 @@ An [MCP](https://modelcontextprotocol.io) server for **[Connecter](https://www.d
 
 | Area | Tools |
 |---|---|
-| **System** | `connecter_status`, `restart_connecter`, `read_log`, `list_commands`, `connecter_call` (raw access to any integration command) |
+| **System** | `connecter_status`, `self_test`, `restart_connecter`, `read_log`, `list_commands`, `connecter_call` (raw access to any integration command) |
 | **Assets** | `search_assets`, `get_asset`, `catalogue_asset`, `set_description`, `tag_assets`, `untag_assets`, `set_previews`, `remove_previews`, `show_in_connecter`, `asset_properties`, `asset_versions` |
-| **Tags** | `list_tags`, `create_tag`, `rename_tag`, `move_tag`, `delete_tag`, `set_tag_color` |
-| **Files & folders** | `move_asset`, `rename_asset`, `folder_operation`: moves made through Connecter, so tags and previews follow the files |
-| **Ingestion** | `library_categories`, `inspect_folder` (tells previews apart from texture maps), `ingest_model` (move a download into the library and catalogue it in one step) |
-| **Health** | `audit_library`, `find_missing_assets`, `relocate_asset`, `batch_relocate` |
+| **Tags** | `list_tags`, `create_tag`, `rename_tag`, `move_tag`, `delete_tag`, `set_tag_color`, `sync_tags_to_folders` (tag models from their library folder), `restructure_taxonomy` (bulk-move assets between tags) |
+| **Files & folders** | `move_asset`, `rename_asset`, `folder_operation`, `rename_cleanly` (strip download-site prefixes from folder names), `rescan`: changes made through Connecter, so tags and previews follow the files |
+| **Ingestion** | `ingest_queue` (downloads waiting to be filed), `library_categories`, `inspect_folder` (tells previews apart from texture maps), `ingest_model` (move a download into the library and catalogue it in one step) |
+| **Health** | `audit_library`, `library_stats`, `find_duplicates`, `attach_folder_previews` (give preview-less models the images in their folder), `orphan_cleanup` |
+| **Missing assets** | `find_missing_assets`, `relocate_asset`, `batch_relocate`, `relocate_folder`, `resolve_deleted` |
 | **Textures** | `scan_textures` (reads map paths straight from `.max` files, no 3ds Max needed), `find_texture_candidates`, `localize_textures`, `relink_script` |
-| **Safety** | `backup_workspace`, `change_journal`, `undo` |
+| **Safety** | `backup_workspace`, `restore_workspace`, `change_journal`, `undo` |
 
 Every change is written to a journal (`~/.connecter-mcp/journal.jsonl`) with the API calls that reverse it, so `undo` can roll it back. Tools that move files or touch many assets default to `dry_run=True` and return a plan first.
 

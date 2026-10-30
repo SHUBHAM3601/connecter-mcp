@@ -92,6 +92,8 @@ class Settings:
     search_dirs: list[Path] = field(default_factory=list)
     # Working directory Connecter is normally started from (its Start-menu shortcut uses one).
     launch_dir: Path | None = None
+    # Where new downloads land (ingest_queue). Defaults to ~/Downloads.
+    downloads_dir: Path = field(default_factory=lambda: Path.home() / "Downloads")
 
     @classmethod
     def load(cls) -> "Settings":
@@ -102,4 +104,5 @@ class Settings:
             models_dir=Path(data["models_dir"]) if data.get("models_dir") else None,
             search_dirs=[Path(p) for p in data.get("search_dirs", [])],
             launch_dir=Path(data["launch_dir"]) if data.get("launch_dir") else None,
+            downloads_dir=Path(data["downloads_dir"]) if data.get("downloads_dir") else Path.home() / "Downloads",
         )

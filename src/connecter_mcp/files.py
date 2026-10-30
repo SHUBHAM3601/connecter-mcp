@@ -81,7 +81,7 @@ def classify_images(folder: Path) -> dict:
             reasons.append("texture keyword in name")
         if size and size[0] == size[1] and size[0] >= 2048 and size[0] & (size[0] - 1) == 0:
             reasons.append(f"{size[0]}px power-of-two square")
-        if any(part.lower() in {"maps", "textures", "tex", "texture"} for part in img.relative_to(folder).parts[:-1]):
+        if any(part.lower() in {"map", "maps", "textures", "tex", "texture", "materials", "mat"} for part in img.relative_to(folder).parts[:-1]):
             reasons.append("in a texture folder")
         entry = {"path": str(img), "size": list(size) if size else None, "reasons": reasons}
         (textures if reasons else previews).append(entry)

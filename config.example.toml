@@ -6,6 +6,9 @@ models_dir = 'D:\Library\3D MODELS'
 # Extra folders searched for moved assets and missing texture maps (Connecter's root folders are always searched).
 search_dirs = []
 
+# Where new downloads land, for ingest_queue. Defaults to your Downloads folder.
+# downloads_dir = 'D:\Downloads'
+
 # Working folder Connecter is normally started from; used by restart_connecter.
 # Defaults to the working folder of Connecter's Start-menu shortcut.
 # launch_dir = 'C:\Users\you\Documents\Design Connected\Connecter\Sample Products'
