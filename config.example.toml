@@ -1,0 +1,11 @@
+# Copy to %USERPROFILE%\.connecter-mcp\config.toml and edit. Every setting is optional.
+
+# Folder whose sub-folders are your library categories (enables ingest_model and library_categories).
+models_dir = 'D:\Library\3D MODELS'
+
+# Extra folders searched for moved assets and missing texture maps (Connecter's root folders are always searched).
+search_dirs = []
+
+# Working folder Connecter is normally started from; used by restart_connecter.
+# Defaults to the working folder of Connecter's Start-menu shortcut.
+# launch_dir = 'C:\Users\you\Documents\Design Connected\Connecter\Sample Products'

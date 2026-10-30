@@ -1,0 +1,21 @@
+[project]
+name = "connecter-mcp"
+version = "0.1.0"
+description = "MCP server for Design Connected's Connecter asset manager: search, tag, catalogue, ingest, audit, relocate and fix textures from any MCP client."
+readme = "README.md"
+license = { text = "MIT" }
+requires-python = ">=3.11"
+dependencies = [
+    "mcp>=2.3,<3",
+    "olefile>=0.47",
+]
+
+[project.scripts]
+connecter-mcp = "connecter_mcp.server:main"
+
+[build-system]
+requires = ["hatchling"]
+build-backend = "hatchling.build"
+
+[tool.hatch.build.targets.wheel]
+packages = ["src/connecter_mcp"]
