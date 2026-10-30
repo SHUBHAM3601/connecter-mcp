@@ -18,4 +18,4 @@ search_dirs = []
 
 # Headless 3ds Max jobs wait their turn while 3ds Max is busy (e.g. rendering): they are refused when
 # 3ds Max uses more CPU than this, in % of one core. Pass force=True to run anyway.
-# max_busy_cpu = 150
+# max_busy_cpu = 50

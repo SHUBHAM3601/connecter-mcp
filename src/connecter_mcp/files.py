@@ -42,6 +42,30 @@ def image_size(path: Path) -> tuple[int, int] | None:
         return None
 
 
+def _asset_records(data: bytes) -> list[str] | None:
+    """The current path of each asset. A record is a GUID, then three length-prefixed UTF-16 strings:
+    type, current path, and the path before any metadata rewrite (which 3ds Max no longer uses)."""
+    for start in range(min(256, len(data))):
+        pos, paths = start, []
+        try:
+            while pos < len(data):
+                pos += 16
+                strings = []
+                for _ in range(3):
+                    n = int.from_bytes(data[pos:pos + 4], "little")
+                    end = pos + 4 + n * 2
+                    if n > 32768 or end + 2 > len(data) or data[end:end + 2] != b"\x00\x00":
+                        raise ValueError
+                    strings.append(data[pos + 4:end].decode("utf-16-le"))
+                    pos = end + 2
+                paths.append(strings[1])
+        except ValueError:
+            continue
+        if paths:
+            return paths
+    return None
+
+
 def max_texture_paths(max_file: Path) -> list[str]:
     """Bitmap paths stored in a .max file's asset metadata (no 3ds Max needed)."""
     try:
@@ -52,11 +76,14 @@ def max_texture_paths(max_file: Path) -> list[str]:
         stream = next((s for s in ("FileAssetMetaData3", "FileAssetMetaData2") if ole.exists(s)), None)
         if not stream:
             return []
-        text = ole.openstream(stream).read().decode("utf-16-le", "ignore")
+        data = ole.openstream(stream).read()
     finally:
         ole.close()
+    parts = _asset_records(data)
+    if parts is None:
+        parts = data.decode("utf-16-le", "ignore").split("\x00")
     seen: dict[str, None] = {}
-    for part in text.split("\x00"):
+    for part in parts:
         if Path(part).suffix.lower() in IMAGE_EXTS | {".ies", ".vrmesh", ".cgeo", ".vdb"} and part.isprintable():
             seen.setdefault(part, None)
     return list(seen)

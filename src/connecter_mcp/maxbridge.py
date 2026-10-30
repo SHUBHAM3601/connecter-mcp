@@ -56,9 +56,19 @@ fn mcpO pairs = (
     for i = 1 to pairs.count do (if i > 1 do t += ","; t += "\"" + mcpEsc pairs[i][1] + "\":" + mcpJ pairs[i][2])
     mcpRaw (t + "}")
 )
-fn mcpToCm v = v * units.SystemScale * (case units.SystemType of (
-    #inches: 2.54; #feet: 30.48; #miles: 160934.4; #millimeters: 0.1
-    #centimeters: 1.0; #meters: 100.0; #kilometers: 100000.0; default: 1.0))
+fn mcpToCm v = (
+    local unitCm = case units.SystemType of (
+        #inches: 2.54
+        #feet: 30.48
+        #miles: 160934.4
+        #millimeters: 0.1
+        #centimeters: 1.0
+        #meters: 100.0
+        #kilometers: 100000.0
+        default: 1.0
+    )
+    v * units.SystemScale * unitCm
+)
 fn mcpBBox nodes = (
     local lo = [1e9, 1e9, 1e9], hi = [-1e9, -1e9, -1e9]
     for o in nodes where isValidNode o and superClassOf o == GeometryClass and classOf o != TargetObject do (
@@ -68,6 +78,7 @@ fn mcpBBox nodes = (
     )
     if lo.x > hi.x then undefined else #(lo, hi)
 )
+global mcpRelinked = #()
 fn mcpRelinkProps obj fromList toList = (
     -- Rewrite every file-name property of obj that matches one of fromList (case-insensitive).
     local n = 0
@@ -75,10 +86,23 @@ fn mcpRelinkProps obj fromList toList = (
         local v = try (getProperty obj p) catch undefined
         if isKindOf v String and v != "" do (
             local i = findItem fromList (toLower v)
-            if i > 0 do (try (setProperty obj p toList[i]; n += 1) catch ())
+            if i > 0 do (try (setProperty obj p toList[i]; n += 1; appendIfUnique mcpRelinked fromList[i]) catch ())
         )
     )
     n
+)
+fn mcpRelinkMeta f fromList toList = (
+    -- Rewrite the asset paths stored in a .max without loading it. Returns -1 if it has no asset metadata.
+    local assets = try (getMAXFileAssetMetadata f) catch undefined
+    if assets == undefined or assets.count == 0 then -1 else (
+        local n = 0
+        for a in assets do (
+            local i = findItem fromList (toLower a.filename)
+            if i > 0 do (a.filename = toList[i]; n += 1; appendIfUnique mcpRelinked fromList[i])
+        )
+        if n > 0 do setMAXFileAssetMetadata f assets
+        n
+    )
 )
 fn mcpFileOwners = (
     -- Every texture map, proxy and light, the things that hold external file paths.
@@ -139,7 +163,7 @@ def find_max() -> Path | None:
     return sorted(set(found), key=lambda d: d.name)[-1] if found else None
 
 
-def max_activity(sample: float = 1.0) -> dict:
+def max_activity(sample: float = 3.0) -> dict:
     """CPU use of running 3ds Max processes (in % of one core) and free memory."""
     procs = [p for p in psutil.process_iter(["name"]) if (p.info["name"] or "").lower() == "3dsmax.exe"]
     for p in procs:
@@ -168,7 +192,7 @@ def run_batch(body: str, scene: Path | None = None, timeout: int = 1800, force: 
         act = max_activity()
         if act["max_cpu_percent"] > s.max_busy_cpu:
             raise ConnecterError(
-                f"3ds Max is busy (using {act['max_cpu_percent']}% CPU, probably rendering), so the headless job "
+                f"3ds Max is busy (using {act['max_cpu_percent']}% CPU, possibly rendering), so the headless job "
                 "was not started. Try again when it is idle, use mode='script', or pass force=True.")
         if act["free_memory_gb"] < 3:
             raise ConnecterError(f"Only {act['free_memory_gb']} GB of memory is free; not starting 3ds Max. Pass force=True to run anyway.")
@@ -185,8 +209,9 @@ def run_batch(body: str, scene: Path | None = None, timeout: int = 1800, force: 
     except subprocess.TimeoutExpired:
         raise ConnecterError(f"3ds Max batch job timed out after {timeout}s. Log: {log}")
     if not out.exists():
-        tail = log.read_text("utf-8", "replace")[-1500:] if log.exists() else proc.stdout[-1500:]
-        raise ConnecterError(f"3ds Max batch job produced no result (exit {proc.returncode}). Log tail:\n{tail}")
+        text = log.read_text("utf-8", "replace") if log.exists() else proc.stdout
+        errors = [line[line.find("MAXScript"):] for line in text.splitlines() if " ERR: " in line and "MAXScript" in line]
+        raise ConnecterError(f"3ds Max batch job produced no result (exit {proc.returncode}).\n" + ("\n".join(errors[:5])[:1500] or text[-1500:]))
     result = json.loads(out.read_text("utf-8-sig", "replace"))
     if isinstance(result, dict) and result.get("error"):
         raise ConnecterError(f"MAXScript error: {result['error']}")

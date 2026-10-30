@@ -8,6 +8,7 @@ consistency_check in file mode) work without 3ds Max. The rest build MAXScript a
 
 from __future__ import annotations
 
+import hashlib
 import json
 import re
 import shutil
@@ -19,12 +20,15 @@ from .client import ConnecterError
 from .config import HOME_DIR, Settings
 from .files import IMAGE_EXTS, image_size
 from .maxbridge import execute, find_max, ms, ms_array
-from .server import (GUID_RE, _db, _get_asset, _texture_status, catalogue_asset, find_texture_candidates, search_assets,
+from .server import (GUID_RE, _db, _get_asset, _texture_status, catalogue_asset, find_texture_candidates, index, search_assets,
                      tool)
 
 MAX_BACKUPS = HOME_DIR / "max_backups"
 MEASUREMENTS = HOME_DIR / "measurements.json"
 PROXY_EXTS = {".vrmesh", ".cgeo", ".abc"}
+RELINK_METHODS = ("metadata", "scene")
+# A .max kept in one of these sub-folders belongs to the model folder above it.
+SCENE_DIRS = {"scene", "scenes", "max", "3dsmax", "3ds max", "model", "models"}
 
 # Texture roles by file-name keyword, for create_material.
 MAP_ROLES = {
@@ -49,8 +53,19 @@ def _max_path(asset: str) -> Path:
     return p
 
 
+def _max_files(folder: str, tag: str) -> list[Path]:
+    """.max files in a folder or tag. Connecter only stores assets that have a tag, preview or
+    description, so a folder is also read from disk or untouched models would be skipped."""
+    found = [Path(a["path"]) for a in search_assets(folder=folder, tag=tag, extension=".max", limit=100000)["assets"]]
+    if folder and not tag:
+        seen = {str(f).lower() for f in found}
+        found += [f for f in Path(folder).rglob("*.max") if str(f).lower() not in seen]
+    return found
+
+
 def _backup_file(path: Path) -> Path:
-    dest = MAX_BACKUPS / time.strftime("%Y%m%d-%H%M%S") / path.name
+    # Hashed, because several models in one run can share a file name like Untitled.max.
+    dest = MAX_BACKUPS / time.strftime("%Y%m%d-%H%M%S") / hashlib.md5(str(path).lower().encode()).hexdigest()[:8] / path.name
     dest.parent.mkdir(parents=True, exist_ok=True)
     shutil.copy2(path, dest)
     return dest
@@ -79,47 +94,95 @@ def _run(body: str, mode: str, scene: Path | None, force: bool, timeout: int = 1
     return execute(body, mode, scene, force, timeout)
 
 
+def _not_in_scene(mapping: dict[str, str], relinked: list[str]) -> list[str]:
+    """Paths listed in the .max's metadata that no map in the scene uses: leftovers, safe to ignore."""
+    done = {p.lower() for p in relinked}
+    return [p for p in mapping if p.lower() not in done]
+
+
 def _relink_lists(mapping: dict[str, str]) -> tuple[str, str]:
     return ms_array([k.lower() for k in mapping]), ms_array(list(mapping.values()))
 
 
-def _mapping_for(max_file: Path, choices: dict[str, str] | None, min_confidence: float, make_relative: bool):
-    found = find_texture_candidates(str(max_file))
+def _model_folder(max_file: Path) -> Path:
+    parent = max_file.parent
+    return parent.parent if parent.name.lower() in SCENE_DIRS else parent
+
+
+def _mapping_for(max_file: Path, choices: dict[str, str] | None, min_confidence: float, make_relative: bool,
+                 other_folders: bool = False):
+    """Old path -> new path. Dead paths whose file is in the model's folder are always safe to fix. Missing
+    files are only matched inside the model too: an equal name elsewhere is often another model's map."""
+    choices = choices or {}
+    model = _model_folder(max_file)
     mapping, unresolved = {}, []
-    for missing, cands in found["missing"].items():
-        src = (choices or {}).get(missing) or (cands[0]["path"] if cands and cands[0]["confidence"] >= min_confidence else None)
+    for path in maxfile.max_texture_paths(max_file):
+        st = _texture_status(path, max_file)
+        if st["status"] == "found_by_name" and path not in choices:
+            mapping[path] = Path(st["resolved"]).name if make_relative else st["resolved"]
+    # Only searching the model's own folder needs nothing from Connecter, so that also works while it is closed.
+    candidates = (find_texture_candidates(str(max_file))["missing"] if other_folders else
+                  {t: index.find([model], Path(t).name) for t in maxfile.max_texture_paths(max_file)
+                   if _texture_status(t, max_file)["status"] == "missing"})
+    for missing, cands in candidates.items():
+        usable = [c for c in cands if c["confidence"] >= min_confidence and (other_folders or Path(c["path"]).is_relative_to(model))]
+        src = choices.get(missing) or (usable[0]["path"] if usable else None)
         if src:
             mapping[missing] = Path(src).name if make_relative else src
         else:
             unresolved.append({"missing": missing, "candidates": cands[:3]})
+    for path, src in choices.items():
+        mapping.setdefault(path, Path(src).name if make_relative else src)
     return mapping, unresolved
+
+
+def _check_method(method: str) -> None:
+    if method not in RELINK_METHODS:
+        raise ConnecterError(f"method must be one of {RELINK_METHODS}")
 
 
 # ---------------------------------------------------------------- textures
 
 @tool
 def relink_max_textures(asset: str, choices: dict[str, str] | None = None, min_confidence: float = 0.9,
-                        make_relative: bool = False, mode: str = "batch", dry_run: bool = True, force: bool = False) -> dict:
-    """Rewrite the missing map, proxy and IES paths stored inside a .max file to the files found for them
-    (bitmaps, V-Ray/Corona bitmaps, proxies, lights - any file-name property). `choices` maps a missing
-    path to the file to use; otherwise the best candidate at or above min_confidence is used.
-    mode='batch' runs 3ds Max headless and saves the file (a backup is kept and `undo` restores it);
+                        make_relative: bool = False, mode: str = "batch", dry_run: bool = True, force: bool = False,
+                        method: str = "metadata", other_folders: bool = False) -> dict:
+    """Rewrite the dead map, proxy and IES paths stored inside a .max file: paths on old drives whose file
+    is in the model's folder, and missing files found for them. `choices` maps a path to the file to use;
+    otherwise the best candidate inside the model's folder at or above min_confidence is used
+    (other_folders=True also accepts other folders of the library, which can match another model's map).
+    method='metadata' (default) rewrites the paths without loading the scene, so the file keeps its
+    3ds Max version and plugin data; files with no asset metadata are reported as no_metadata.
+    method='scene' loads and re-saves the file in this 3ds Max version, and returns paths no map uses
+    as not_in_scene. mode='batch' runs 3ds Max headless (a backup is kept and `undo` restores it);
     mode='script' returns MAXScript for the open 3ds Max. dry_run=True (default) only shows the plan."""
+    _check_method(method)
     max_file = _max_path(asset)
-    mapping, unresolved = _mapping_for(max_file, choices, min_confidence, make_relative)
+    mapping, unresolved = _mapping_for(max_file, choices, min_confidence, make_relative, other_folders)
     plan = {"asset": str(max_file), "relinks": mapping, "unresolved": unresolved}
     if dry_run or not mapping:
         return {"dry_run": dry_run, **plan, **({"note": "Nothing to relink."} if not mapping else {})}
     frm, to = _relink_lists(mapping)
-    body = f"""
+    if method == "metadata":
+        body = f"""
+n = mcpRelinkMeta {ms(max_file)} {frm} {to}
+mcpResult = mcpO #(#("file", {ms(max_file)}), #("relinked", n), #("paths", mcpRelinked))
+"""
+    else:
+        body = f"""
 n = 0
 for o in mcpFileOwners() do n += mcpRelinkProps o {frm} {to}
 if n > 0 do saveMaxFile (maxFilePath + maxFileName) quiet:true
-mcpResult = mcpO #(#("file", maxFilePath + maxFileName), #("relinked", n))
+mcpResult = mcpO #(#("file", maxFilePath + maxFileName), #("relinked", n), #("paths", mcpRelinked))
 """
     backup = _backup_file(max_file) if mode == "batch" else None
-    result = _run(body, mode, max_file, force)
+    result = _run(body, mode, max_file if method == "scene" else None, force)
     if mode == "batch":
+        if method == "metadata":
+            if result["result"]["relinked"] < 0:
+                plan["no_metadata"] = True
+        else:
+            plan["not_in_scene"] = _not_in_scene(mapping, result["result"]["paths"])
         jid = journal.record("relink_max_textures", plan, [{"type": "_restore_file", "payload": {"backup": str(backup), "target": str(max_file)}}])
         result["journal_id"] = jid
     return {**plan, **result}
@@ -127,15 +190,17 @@ mcpResult = mcpO #(#("file", maxFilePath + maxFileName), #("relinked", n))
 
 @tool
 def batch_relink(folder: str = "", tag: str = "", min_confidence: float = 0.9, make_relative: bool = False,
-                 mode: str = "batch", dry_run: bool = True, force: bool = False, limit: int = 200) -> dict:
-    """relink_max_textures for every .max (in a folder or tag) that has missing maps, in one 3ds Max session.
+                 mode: str = "batch", dry_run: bool = True, force: bool = False, limit: int = 200,
+                 method: str = "metadata", other_folders: bool = False) -> dict:
+    """relink_max_textures for every .max (in a folder or tag) that has dead paths, in one 3ds Max session.
     Files are backed up first; `undo` restores them. dry_run=True (default) lists what would change."""
-    files = [Path(a["path"]) for a in search_assets(folder=folder, tag=tag, extension=".max", limit=100000)["assets"]]
+    _check_method(method)
+    files = _max_files(folder, tag)
     jobs, unresolved = [], {}
     for f in files[:limit]:
         if not f.exists():
             continue
-        mapping, bad = _mapping_for(f, None, min_confidence, make_relative)
+        mapping, bad = _mapping_for(f, None, min_confidence, make_relative, other_folders)
         if mapping:
             jobs.append((f, mapping))
         if bad:
@@ -144,15 +209,28 @@ def batch_relink(folder: str = "", tag: str = "", min_confidence: float = 0.9, m
     if dry_run or not jobs:
         return {"dry_run": dry_run, "files_checked": min(len(files), limit), **plan}
     entries = ", ".join(f"#({ms(f)}, {_relink_lists(m)[0]}, {_relink_lists(m)[1]})" for f, m in jobs)
-    body = f"""
+    if method == "metadata":
+        body = f"""
+jobs = #({entries})
+results = #()
+for j in jobs do (
+    mcpRelinked = #()
+    n = mcpRelinkMeta j[1] j[2] j[3]
+    append results (mcpO #(#("file", j[1]), #("relinked", n), #("paths", mcpRelinked)))
+)
+mcpResult = mcpO #(#("files", results))
+"""
+    else:
+        body = f"""
 jobs = #({entries})
 results = #()
 for j in jobs do (
     if loadMaxFile j[1] quiet:true useFileUnits:true then (
         n = 0
+        mcpRelinked = #()
         for o in mcpFileOwners() do n += mcpRelinkProps o j[2] j[3]
         if n > 0 do saveMaxFile j[1] quiet:true
-        append results (mcpO #(#("file", j[1]), #("relinked", n)))
+        append results (mcpO #(#("file", j[1]), #("relinked", n), #("paths", mcpRelinked)))
     ) else append results (mcpO #(#("file", j[1]), #("error", "could not open")))
 )
 resetMaxFile #noPrompt
@@ -160,8 +238,14 @@ mcpResult = mcpO #(#("files", results))
 """
     backups = [{"backup": str(_backup_file(f)), "target": str(f)} for f, _ in jobs] if mode == "batch" else []
     guard = 'if getSaveRequired() do throw "The open scene has unsaved changes. Save it first: this script opens other files."\n'
-    result = execute((guard if mode == "script" else "") + body, mode, None, force, timeout=600 + 120 * len(jobs))
+    result = execute((guard if mode == "script" and method == "scene" else "") + body, mode, None, force, timeout=600 + 120 * len(jobs))
     if mode == "batch":
+        by_file = {r["file"].lower(): r for r in result["result"]["files"]}
+        if method == "metadata":
+            plan["no_metadata"] = [r["file"] for r in result["result"]["files"] if r.get("relinked", 0) < 0]
+        else:
+            plan["not_in_scene"] = {str(f): gone for f, m in jobs
+                                    if (gone := _not_in_scene(m, by_file.get(str(f).lower(), {}).get("paths", [])))}
         result["journal_id"] = journal.record("batch_relink", plan, [{"type": "_restore_file", "payload": b} for b in backups])
     return {**plan, **result}
 
@@ -169,8 +253,10 @@ mcpResult = mcpO #(#("files", results))
 @tool
 def verify_textures(asset: str = "", folder: str = "", tag: str = "", limit: int = 200) -> dict:
     """Check every map of .max assets without 3ds Max: missing, found only by name, unreadable or corrupt
-    images, very large maps (over 8K) and absolute paths that point outside the model's folder."""
-    files = [_max_path(asset)] if asset else [Path(a["path"]) for a in search_assets(folder=folder, tag=tag, extension=".max", limit=100000)["assets"]]
+    images, very large maps (over 8K) and absolute paths that point outside the model's folder. Reads the
+    file's metadata, which can list old paths nothing uses any more; consistency_check(mode='batch')
+    or relink_max_textures (not_in_scene) show which missing files the scene really uses."""
+    files = [_max_path(asset)] if asset else _max_files(folder, tag)
     from PIL import Image
 
     report, totals = {}, {"ok": 0, "missing": 0, "found_by_name": 0, "unreadable": 0, "oversized": 0, "outside_folder": 0}
@@ -204,7 +290,8 @@ def verify_textures(asset: str = "", folder: str = "", tag: str = "", limit: int
 @tool
 def scene_missing_assets(scene: str, extra_folders: list[str] | None = None) -> dict:
     """Missing external files of any .max scene (maps, proxies, IES, VDB, XRefs) with ranked candidates
-    found across the library and search folders. Fix them with relink_max_textures or collect_for_project."""
+    found across the library and search folders. Fix them with relink_max_textures or collect_for_project.
+    Reads the file's metadata, which can list old paths nothing uses any more (see verify_textures)."""
     max_file = _max_path(scene)
     found = find_texture_candidates(str(max_file), extra_folders)
     by_type: dict[str, int] = {}
@@ -343,7 +430,9 @@ def _converter_script(target: str) -> str:
     if target == "corona":
         conv = Path(rf"C:\Program Files\Chaos\Corona\Corona Renderer for 3ds Max\{year}\Scripts\coronaConverter.ms")
         return f"""
+-- Declared first: undeclared names inside this script's block would be locals, hiding the global.
 global CoronaConverterSuppressGui = true
+global CoronaConverter
 if CoronaConverter == undefined do fileIn {ms(conv)}
 CoronaConverter.converterSettings.silent = true
 CoronaConverter.converterSettings.showWarnings = false
@@ -355,8 +444,13 @@ if rc.count > 0 do renderers.current = rc[1]()
     if target == "vray":
         utils = Path(rf"C:\ProgramData\Autodesk\ApplicationPlugins\VRay3dsMax{year}\scripts\vrayutils.ms")
         return f"""
+global ConvertToVRay
 if ConvertToVRay == undefined do fileIn {ms(utils)}
+-- ConvertToVRay updates V-Ray's converter dialog as it goes. Without that dialog open (always, when
+-- headless) it fails partway, so stand in for it, and only for the length of the conversion.
+python.execute "if 'vr_sceneconverter_dialog' not in globals():\\n    class _McpNoDialog:\\n        def __getattr__(self, name):\\n            return lambda *a, **k: None\\n    vr_sceneconverter_dialog = _McpNoDialog()"
 ConvertToVRay false
+python.execute "if type(vr_sceneconverter_dialog).__name__ == '_McpNoDialog':\\n    del vr_sceneconverter_dialog"
 rc = for c in RendererClass.classes where matchPattern (c as string) pattern:"V_Ray*" and not matchPattern (c as string) pattern:"*GPU*" collect c
 if rc.count > 0 do renderers.current = rc[1]()
 """
@@ -970,7 +1064,9 @@ missing = #()
 ATSOps.Refresh()
 atsFiles = #()
 ATSOps.GetFiles &atsFiles
-for f in atsFiles where not doesFileExist f and (getFilenameType f) != "" do append missing f
+-- A bare or stale path still resolves if the file sits next to the scene or on a map path.
+for f in atsFiles where (getFilenameType f) != "" and not doesFileExist f and not doesFileExist (maxFilePath + filenameFromPath f) \
+    and (mapPaths.getFullFilePath (filenameFromPath f)) == "" do append missing f
 if missing.count > 0 do append issues ((missing.count as string) + " external files are missing")
 mcpResult = mcpO #(#("renderer", r), #("issues", issues), #("non_uniform_scale", nonUni), #("negative_scale", neg),
     #("empty_objects", empty), #("missing_files", missing))
